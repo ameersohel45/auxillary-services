@@ -7,8 +7,10 @@ import (
 	"bulk_issuance/utils"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -23,7 +25,7 @@ type Services struct {
 type IService interface {
 	GetSampleCSVForSchema(schemaName string) (*bytes.Buffer, error)
 	InsertIntoFileData(rows [][]string, fileName string, header string, principal *models.JWTClaimBody) (uint, error)
-	ProcessDataFromCSV(header http.Header, vcName string, file io.Reader) (int, int, [][]string, string, error)
+	ProcessDataFromCSV(header http.Header, vcName string, file io.Reader) (int, int, int, [][]string, string, error)
 	GetCSVReport(id int, userId string) (*string, *bytes.Buffer, error)
 	GetUploadedFiles(userId string, limit *int64, offset *int64) ([]*models.UploadedFileDTO, error)
 }
@@ -52,54 +54,144 @@ func (services *Services) InsertIntoFileData(rows [][]string, fileName string, h
 	return services.repo.Insert(&fileUpload)
 }
 
-func (services *Services) ProcessDataFromCSV(header http.Header, schemaName string, file io.Reader) (int, int, [][]string, string, error) {
+func (services *Services) ProcessDataFromCSV(header http.Header, schemaName string, file io.Reader) (int, int, int, [][]string, string, error) {
 	csvScanner, err := NewScanner(file)
 	if err != nil {
-		return 0, 0, nil, "", err
+		return 0, 0, 0, nil, "", err
 	}
 	var (
-		totalSuccess = 0
+		totalCreated = 0
+		totalUpdated = 0
 		totalErrors  = 0
 	)
 	rows := make([][]string, 0)
-	log.Info("processing all rows from csv")
-	properties, err := getSchemaPropertyNames(schemaName)
-	if err != nil {
-		return 0, 0, rows, "", err
-	}
+	log.Info("processing all rows from csv with intelligent create/update logic")
+
+	authorizationToken := header["Authorization"][0]
+
 	for csvScanner.Scan() {
 		currRow := csvScanner.Row
-		schemaRequest := createSchemaRequest(properties, currRow, csvScanner.Head)
-		res, err := callRegistryAPI(schemaName, schemaRequest, header["Authorization"][0])
-		utils.LogErrorIfAny("Error in creating a record : %v", err)
+
+		// Extract unique identifier for the entity
+		identifier, _, err := extractUniqueIdentifier(schemaName, currRow, csvScanner.Head)
+		if err != nil {
+			// If we can't extract identifier, treat as error
+			csvScanner.appendHeader("Errors")
+			currRow = append(currRow, "Identifier extraction failed: "+err.Error())
+			totalErrors += 1
+			rows = append(rows, currRow)
+			continue
+		}
+
+		// Search for existing record
+		searchBody := buildSearchBody(schemaName, identifier)
+		searchResp, searchErr := callRegistrySearchAPI(schemaName, searchBody, authorizationToken)
+
+		var res *http.Response
+		var operationType string
+
+		if searchErr != nil {
+			// Search failed, treat as new record and create
+			log.Warnf("Search failed for %s with identifier %s, creating new record: %v", schemaName, identifier, searchErr)
+			schemaRequest := createSchemaRequest(currRow, csvScanner.Head)
+			res, err = callRegistryAPI(schemaName, schemaRequest, authorizationToken)
+			operationType = "CREATE"
+		} else {
+			// Search successful, check if record exists
+			osid := extractOsidFromSearch(schemaName, searchResp)
+			log.Infof("Search result for %s with identifier %s: osid=%s", schemaName, identifier, osid)
+			if osid == "" {
+				// Record not found, create new
+				log.Infof("No existing record found for %s with identifier %s, creating new record", schemaName, identifier)
+				schemaRequest := createSchemaRequest(currRow, csvScanner.Head)
+				res, err = callRegistryAPI(schemaName, schemaRequest, authorizationToken)
+				operationType = "CREATE"
+			} else {
+				// Record found, update existing
+				log.Infof("Existing record found for %s with identifier %s, updating record", schemaName, identifier)
+				schemaRequest := createSchemaRequest(currRow, csvScanner.Head)
+				removeFieldsForUpdate(schemaName, schemaRequest)
+				res, err = callRegistryUpdateAPI(schemaName, osid, schemaRequest, authorizationToken)
+				operationType = "UPDATE"
+			}
+		}
+
+		if err != nil {
+			utils.LogErrorIfAny("Error in "+operationType+" operation for record with identifier "+identifier+": %v", err)
+		}
+
 		if res.StatusCode != 200 {
 			csvScanner.appendHeader("Errors")
 			currRow = appendErrorsToCurrentRow(res, currRow)
 			totalErrors += 1
 		} else {
-			totalSuccess += 1
+			if operationType == "CREATE" {
+				totalCreated += 1
+			} else {
+				totalUpdated += 1
+			}
 		}
 		rows = append(rows, currRow)
 	}
 	log.Info("processed all rows from csv")
-	return totalSuccess, totalErrors, rows, csvScanner.getHeaderAsString(), nil
+	return totalCreated, totalUpdated, totalErrors, rows, csvScanner.getHeaderAsString(), nil
 }
 
 func callRegistryAPI(schemaName string, schemaRequest map[string]interface{}, token string) (*http.Response, error) {
 	methodName := "POST"
 	postBody, err := json.Marshal(schemaRequest)
 	utils.LogErrorIfAny("Error in creating request %v : %v", err, config.Config.Registry.BaseUrl+"api/v1/"+schemaName)
+
 	req, err := http.NewRequest(methodName, config.Config.Registry.BaseUrl+"api/v1/"+schemaName, bytes.NewBuffer(postBody))
 	utils.LogErrorIfAny("Error in creating request %v : %v", err, config.Config.Registry.BaseUrl+"api/v1/"+schemaName)
+
+	// Ensure token has Bearer prefix
+	if !strings.HasPrefix(token, "Bearer ") {
+		token = "Bearer " + token
+	}
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
-	return client.Do(req)
+
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Errorf("Error calling registry API: %v", err)
+		return nil, err
+	}
+
+	return resp, err
 }
 
-func createSchemaRequest(properties []string, row []string, head map[string]int) map[string]interface{} {
+
+func createSchemaRequest(row []string, head map[string]int) map[string]interface{} {
 	jsonBody := make(map[string]interface{})
-	for _, property := range properties {
-		jsonBody[property] = row[head[property]]
+	for header, index := range head {
+		if index >= len(row) {
+			continue
+		}
+		// Sanitize the value
+		value := strings.TrimSpace(row[index])
+
+		// Split header by '.' for nesting
+		parts := strings.Split(header, ".")
+
+		if len(parts) == 1 {
+			// No nesting, add directly
+			jsonBody[parts[0]] = value
+		} else {
+			// Nested field
+			parentKey := parts[0]
+			childKey := parts[1]
+
+			// Create the parent map if it doesn't exist
+			if _, ok := jsonBody[parentKey]; !ok {
+				jsonBody[parentKey] = make(map[string]interface{})
+			}
+
+			// Add the value to the nested map
+			nestedMap := jsonBody[parentKey].(map[string]interface{})
+			nestedMap[childKey] = value
+		}
 	}
 	return jsonBody
 }
@@ -107,12 +199,161 @@ func createSchemaRequest(properties []string, row []string, head map[string]int)
 func appendErrorsToCurrentRow(res *http.Response, currRow []string) []string {
 	resBody, err := io.ReadAll(res.Body)
 	utils.LogErrorIfAny("Error while reading error response from adding single record : %v", err)
+
+	if len(resBody) == 0 {
+		currRow = append(currRow, "Empty error response from server")
+		return currRow
+	}
+
 	var responseMap map[string]interface{}
 	err = json.Unmarshal(resBody, &responseMap)
 	if err != nil {
 		log.Errorf("Unmarshal Error : %v", err)
+		currRow = append(currRow, "Invalid error response from server")
+		return currRow
 	}
-	errObj := responseMap["params"].(map[string]interface{})
-	currRow = append(currRow, errObj["errmsg"].(string))
+
+	// Safely check if responseMap is nil
+	if responseMap == nil {
+		currRow = append(currRow, "No error message in response")
+		return currRow
+	}
+
+	params, ok := responseMap["params"].(map[string]interface{})
+	if !ok || params == nil || params["errmsg"] == nil {
+		currRow = append(currRow, "No error message in response")
+		return currRow
+	}
+	currRow = append(currRow, fmt.Sprintf("%v", params["errmsg"]))
 	return currRow
+}
+
+// extractUniqueIdentifier extracts the unique identifier from a row based on entity type
+func extractUniqueIdentifier(entityName string, row []string, headers map[string]int) (string, int, error) {
+	var identifierField string
+	var identifierIndex int
+
+	// Determine the identifier field based on entity type
+	if strings.EqualFold(entityName, "School") {
+		identifierField = "schoolId"
+	} else if strings.EqualFold(entityName, "Student") {
+		identifierField = "studentId"
+	} else {
+		identifierField = "code"
+	}
+
+	// Find the identifier column index
+	identifierIndex, exists := headers[identifierField]
+	if !exists {
+		return "", -1, fmt.Errorf("identifier field '%s' not found in CSV headers", identifierField)
+	}
+
+	if identifierIndex >= len(row) {
+		return "", -1, fmt.Errorf("identifier column index out of bounds")
+	}
+
+	identifier := strings.TrimSpace(row[identifierIndex])
+	if identifier == "" {
+		return "", -1, fmt.Errorf("identifier value is empty")
+	}
+
+	return identifier, identifierIndex, nil
+}
+
+// buildSearchBody builds the search request body for the registry
+func buildSearchBody(entityName, identifier string) map[string]interface{} {
+	filters := map[string]interface{}{}
+	if strings.EqualFold(entityName, "School") {
+		filters["schoolId"] = map[string]interface{}{"eq": identifier}
+	} else if strings.EqualFold(entityName, "Student") {
+		filters["studentId"] = map[string]interface{}{"eq": identifier}
+	} else {
+		filters["code"] = map[string]interface{}{"eq": identifier}
+	}
+	return map[string]interface{}{
+		"offset":  0,
+		"limit":   1,
+		"filters": filters,
+	}
+}
+
+// callRegistrySearchAPI calls the registry search endpoint
+func callRegistrySearchAPI(entityName string, body map[string]interface{}, token string) (map[string]interface{}, error) {
+	url := config.Config.Registry.BaseUrl + "api/v1/" + entityName + "/search"
+
+	b, _ := json.Marshal(body)
+
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(b))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Errorf("Error reading response body: %v", err)
+		return nil, err
+	}
+
+	// Check if response body is empty
+	if len(bodyBytes) == 0 {
+		log.Warnf("Empty response body from search API for %s", entityName)
+		return map[string]interface{}{"data": []interface{}{}}, nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		log.Errorf("Search error decoding response: %v", err)
+		return nil, err
+	}
+	return result, nil
+}
+
+// extractOsidFromSearch extracts the osid from the search response
+func extractOsidFromSearch(entityName string, searchResp map[string]interface{}) string {
+	data, ok := searchResp["data"].([]interface{})
+	if !ok || len(data) == 0 {
+		return ""
+	}
+	entity, ok := data[0].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	osid, _ := entity["osid"].(string)
+	return osid
+}
+
+// removeFieldsForUpdate removes fields from the update body as per entity type
+func removeFieldsForUpdate(entityName string, body map[string]interface{}) {
+	if strings.EqualFold(entityName, "School") {
+		delete(body, "schoolId")
+		delete(body, "schoolSuffix")
+		delete(body, "provinceCode")
+		delete(body, "districtCode")
+		delete(body, "communeCode")
+	} else if strings.EqualFold(entityName, "Student") {
+		delete(body, "studentId")
+	} else {
+		delete(body, "code")
+		delete(body, "provinceCode")
+		delete(body, "districtCode")
+		delete(body, "communeCode")
+	}
+}
+
+// callRegistryUpdateAPI calls the registry update endpoint
+func callRegistryUpdateAPI(entityName, osid string, body map[string]interface{}, token string) (*http.Response, error) {
+	url := config.Config.Registry.BaseUrl + "api/v1/" + entityName + "/" + osid
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PUT", url, bytes.NewBuffer(b))
+
+	// Ensure token has Bearer prefix
+	if !strings.HasPrefix(token, "Bearer ") {
+		token = "Bearer " + token
+	}
+	req.Header.Set("Authorization", token)
+	req.Header.Set("Content-Type", "application/json")
+	return client.Do(req)
 }

@@ -12,6 +12,18 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// UploadResponse is used to guarantee JSON field order in the upload response
+// Order: ID, created, updated, success, error, totalRows
+//
+type UploadResponse struct {
+	ID        uint `json:"ID"`
+	Created   uint `json:"created"`
+	Updated   uint `json:"updated"`
+	Success   uint `json:"success"`
+	Error     uint `json:"error"`
+	TotalRows uint `json:"totalRows"`
+}
+
 func (c *Controllers) createRecordsForSchema(params upload_and_create_records.PostV1SchemaNameUploadParams,
 	principal *models.JWTClaimBody) middleware.Responder {
 	log.Info("Creating records")
@@ -29,7 +41,7 @@ func (c *Controllers) createRecordsForSchema(params upload_and_create_records.Po
 				Message: "Invalid CSV File",
 			})
 	}
-	totalSuccess, totalErrors, rows, header, err := c.services.
+	totalCreated, totalUpdated, totalErrors, rows, header, err := c.services.
 		ProcessDataFromCSV(params.HTTPRequest.Header, params.SchemaName, strings.NewReader(string(fileBytes)))
 
 	if err != nil {
@@ -41,14 +53,15 @@ func (c *Controllers) createRecordsForSchema(params upload_and_create_records.Po
 	fileName := getFileName(params)
 	id, err := c.services.InsertIntoFileData(rows, fileName, header, principal)
 	utils.LogErrorIfAny("Error while adding entry to table FileData : %v", err)
-	successFailureCount := map[string]uint{
-		"success":   uint(totalSuccess),
-		"error":     uint(totalErrors),
-		"totalRows": uint(totalSuccess + totalErrors),
-		"ID":        id,
+	response := UploadResponse{
+		ID:        id,
+		Created:   uint(totalCreated),
+		Updated:   uint(totalUpdated),
+		Success:   uint(totalCreated + totalUpdated),
+		Error:     uint(totalErrors),
+		TotalRows: uint(totalCreated + totalUpdated + totalErrors),
 	}
-	response := upload_and_create_records.NewPostV1SchemaNameUploadOK().WithPayload(successFailureCount)
-	return response
+	return upload_and_create_records.NewPostV1SchemaNameUploadOK().WithPayload(response)
 }
 
 func getFileName(params upload_and_create_records.PostV1SchemaNameUploadParams) string {
