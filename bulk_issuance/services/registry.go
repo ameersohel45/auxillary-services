@@ -25,19 +25,6 @@ func getSchemaPropertyNames(schemaName string) ([]string, error) {
 	}
 }
 
-func getSchemaPropertiesAndSampleValues(schemaName string) ([]string, []string, error) {
-	schemaProperties, err := getSchemaProperties(schemaName)
-	if err == nil {
-		properties := make([]string, 0)
-		sampleValues := make([]string, 0)
-		for key, value := range schemaProperties {
-			properties = append(properties, key)
-			sampleValues = append(sampleValues, utils.GetSampleValueByType(value))
-		}
-		return properties, sampleValues, nil
-	}
-	return nil, nil, err
-}
 
 func getSchemaProperties(schemaName string) (spec.SchemaProperties, error) {
 	registrySwaggerSpecification := getSwaggerJson()
@@ -56,4 +43,41 @@ func getSwaggerJson() spec.Swagger {
 	err = json.Unmarshal(body, &responseMap)
 	utils.LogErrorIfAny("Error creating request body for %v : %v", err, config.Config.Registry.BaseUrl+"api/docs/swagger.json")
 	return responseMap
+}
+
+// flattenSchemaProperties recursively flattens schema properties for CSV headers and sample values.
+func flattenSchemaProperties(
+    prefix string,
+    properties spec.SchemaProperties,
+    resultHeaders *[]string,
+    resultSamples *[]string,
+) {
+    for key, value := range properties {
+        // Compose the full property name
+        var fullKey string
+        if prefix != "" {
+            fullKey = prefix + "." + key
+        } else {
+            fullKey = key
+        }
+
+        // If the property is an object, recurse
+        if len(value.Type) > 0 && value.Type[0] == "object" && value.Properties != nil {
+            flattenSchemaProperties(fullKey, value.Properties, resultHeaders, resultSamples)
+        } else {
+            *resultHeaders = append(*resultHeaders, fullKey)
+            *resultSamples = append(*resultSamples, utils.GetSampleValueByType(value))
+        }
+    }
+}
+
+func getSchemaPropertiesAndSampleValues(schemaName string) ([]string, []string, error) {
+    schemaProperties, err := getSchemaProperties(schemaName)
+    if err != nil {
+        return nil, nil, err
+    }
+    headers := make([]string, 0)
+    samples := make([]string, 0)
+    flattenSchemaProperties("", schemaProperties, &headers, &samples)
+    return headers, samples, nil
 }
