@@ -116,7 +116,6 @@ func (services *Services) ProcessDataFromCSV(header http.Header, schemaName stri
 				// Record found, update existing
 				log.Infof("Existing record found for %s with identifier %s, updating record", schemaName, identifier)
 				schemaRequest := createSchemaRequest(currRow, csvScanner.Head)
-				// removeFieldsForUpdate(schemaName, schemaRequest, authorizationToken)
 				res, err = callRegistryUpdateAPI(schemaName, osid, schemaRequest, authorizationToken)
 				operationType = "UPDATE"
 			}
@@ -347,18 +346,6 @@ func extractOsidFromSearch(entityName string, searchResp map[string]interface{})
 	osid, _ := entity["osid"].(string)
 	return osid
 }
-
-// removeFieldsForUpdate removes unique index fields from the update body as per entity type
-// func removeFieldsForUpdate(entityName string, body map[string]interface{}, token string) {
-// 	uniqueIndexFields, err := getUniqueIndexFieldsFromRegistry(entityName, token)
-// 	if err != nil {
-// 		// fallback: do nothing if uniqueIndexFields can't be fetched
-// 		return
-// 	}
-// 	for _, field := range uniqueIndexFields {
-// 		delete(body, field)
-// 	}
-// }
 
 // callRegistryUpdateAPI calls the registry update endpoint
 func callRegistryUpdateAPI(entityName, osid string, body map[string]interface{}, token string) (*http.Response, error) {
