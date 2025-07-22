@@ -69,11 +69,17 @@ func (services *Services) ProcessDataFromCSV(header http.Header, schemaName stri
 
 	authorizationToken := header["Authorization"][0]
 
+	// Fetch uniqueIndexFields from registry schema
+	uniqueIndexFields, err := getUniqueIndexFieldsFromRegistry(schemaName, authorizationToken)
+	if err != nil {
+		return 0, 0, 0, nil, "", fmt.Errorf("failed to fetch unique index fields: %v", err)
+	}
+
 	for csvScanner.Scan() {
 		currRow := csvScanner.Row
 
-		// Extract unique identifier for the entity
-		identifier, _, err := extractUniqueIdentifier(schemaName, currRow, csvScanner.Head)
+		// Extract unique identifier for the entity (now dynamic)
+		identifier, err := extractUniqueIdentifierDynamic(currRow, csvScanner.Head, uniqueIndexFields)
 		if err != nil {
 			// If we can't extract identifier, treat as error
 			csvScanner.appendHeader("Errors")
@@ -84,7 +90,7 @@ func (services *Services) ProcessDataFromCSV(header http.Header, schemaName stri
 		}
 
 		// Search for existing record
-		searchBody := buildSearchBody(schemaName, identifier)
+		searchBody := buildSearchBodyDynamic(uniqueIndexFields, identifier)
 		searchResp, searchErr := callRegistrySearchAPI(schemaName, searchBody, authorizationToken)
 
 		var res *http.Response
@@ -110,7 +116,7 @@ func (services *Services) ProcessDataFromCSV(header http.Header, schemaName stri
 				// Record found, update existing
 				log.Infof("Existing record found for %s with identifier %s, updating record", schemaName, identifier)
 				schemaRequest := createSchemaRequest(currRow, csvScanner.Head)
-				removeFieldsForUpdate(schemaName, schemaRequest)
+				// removeFieldsForUpdate(schemaName, schemaRequest, authorizationToken)
 				res, err = callRegistryUpdateAPI(schemaName, osid, schemaRequest, authorizationToken)
 				operationType = "UPDATE"
 			}
@@ -152,7 +158,6 @@ func callRegistryAPI(schemaName string, schemaRequest map[string]interface{}, to
 	req.Header.Set("Authorization", token)
 	req.Header.Set("Content-Type", "application/json")
 
-
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Errorf("Error calling registry API: %v", err)
@@ -161,7 +166,6 @@ func callRegistryAPI(schemaName string, schemaRequest map[string]interface{}, to
 
 	return resp, err
 }
-
 
 func createSchemaRequest(row []string, head map[string]int) map[string]interface{} {
 	jsonBody := make(map[string]interface{})
@@ -228,47 +232,66 @@ func appendErrorsToCurrentRow(res *http.Response, currRow []string) []string {
 	return currRow
 }
 
-// extractUniqueIdentifier extracts the unique identifier from a row based on entity type
-func extractUniqueIdentifier(entityName string, row []string, headers map[string]int) (string, int, error) {
-	var identifierField string
-	var identifierIndex int
-
-	// Determine the identifier field based on entity type
-	if strings.EqualFold(entityName, "School") {
-		identifierField = "schoolId"
-	} else if strings.EqualFold(entityName, "Student") {
-		identifierField = "studentId"
-	} else {
-		identifierField = "code"
+// Helper to fetch uniqueIndexFields from registry API
+func getUniqueIndexFieldsFromRegistry(schemaName string, token string) ([]string, error) {
+	schemaResp, err := getFullSchemaFromRegistry(schemaName, token)
+	if err != nil {
+		return nil, err
 	}
-
-	// Find the identifier column index
-	identifierIndex, exists := headers[identifierField]
-	if !exists {
-		return "", -1, fmt.Errorf("identifier field '%s' not found in CSV headers", identifierField)
+	result, ok := schemaResp["result"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing result in schema response")
 	}
-
-	if identifierIndex >= len(row) {
-		return "", -1, fmt.Errorf("identifier column index out of bounds")
+	osSchemaConfig, ok := result["osSchemaConfiguration"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing osSchemaConfiguration in schema response")
 	}
-
-	identifier := strings.TrimSpace(row[identifierIndex])
-	if identifier == "" {
-		return "", -1, fmt.Errorf("identifier value is empty")
+	uniqueIndexFieldsIface, ok := osSchemaConfig["uniqueIndexFields"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing uniqueIndexFields in schema response")
 	}
-
-	return identifier, identifierIndex, nil
+	var uniqueIndexFields []string
+	for _, f := range uniqueIndexFieldsIface {
+		if s, ok := f.(string); ok {
+			// Handle case like "(name_en, dateOfBirth, gender)"
+			s = strings.TrimSpace(s)
+			if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+				// Remove parentheses and split by comma
+				inner := s[1 : len(s)-1]
+				fields := strings.Split(inner, ",")
+				for _, field := range fields {
+					uniqueIndexFields = append(uniqueIndexFields, strings.TrimSpace(field))
+				}
+			} else {
+				uniqueIndexFields = append(uniqueIndexFields, s)
+			}
+		}
+	}
+	if len(uniqueIndexFields) == 0 {
+		return nil, fmt.Errorf("no uniqueIndexFields defined in schema")
+	}
+	return uniqueIndexFields, nil
 }
 
-// buildSearchBody builds the search request body for the registry
-func buildSearchBody(entityName, identifier string) map[string]interface{} {
+// Extracts unique identifier from a row using dynamic uniqueIndexFields
+func extractUniqueIdentifierDynamic(row []string, headers map[string]int, uniqueIndexFields []string) (string, error) {
+	var identifierParts []string
+	for _, field := range uniqueIndexFields {
+		idx, ok := headers[field]
+		if !ok || idx >= len(row) {
+			return "", fmt.Errorf("unique field %s not found in CSV", field)
+		}
+		identifierParts = append(identifierParts, strings.TrimSpace(row[idx]))
+	}
+	return strings.Join(identifierParts, "|"), nil // or use a tuple/JSON as needed
+}
+
+// Build search body for dynamic unique index fields
+func buildSearchBodyDynamic(uniqueIndexFields []string, identifier string) map[string]interface{} {
 	filters := map[string]interface{}{}
-	if strings.EqualFold(entityName, "School") {
-		filters["schoolId"] = map[string]interface{}{"eq": identifier}
-	} else if strings.EqualFold(entityName, "Student") {
-		filters["studentId"] = map[string]interface{}{"eq": identifier}
-	} else {
-		filters["code"] = map[string]interface{}{"eq": identifier}
+	identifierParts := strings.Split(identifier, "|")
+	for i, field := range uniqueIndexFields {
+		filters[field] = map[string]interface{}{"eq": identifierParts[i]}
 	}
 	return map[string]interface{}{
 		"offset":  0,
@@ -325,23 +348,17 @@ func extractOsidFromSearch(entityName string, searchResp map[string]interface{})
 	return osid
 }
 
-// removeFieldsForUpdate removes fields from the update body as per entity type
-func removeFieldsForUpdate(entityName string, body map[string]interface{}) {
-	if strings.EqualFold(entityName, "School") {
-		delete(body, "schoolId")
-		delete(body, "schoolSuffix")
-		delete(body, "provinceCode")
-		delete(body, "districtCode")
-		delete(body, "communeCode")
-	} else if strings.EqualFold(entityName, "Student") {
-		delete(body, "studentId")
-	} else {
-		delete(body, "code")
-		delete(body, "provinceCode")
-		delete(body, "districtCode")
-		delete(body, "communeCode")
-	}
-}
+// removeFieldsForUpdate removes unique index fields from the update body as per entity type
+// func removeFieldsForUpdate(entityName string, body map[string]interface{}, token string) {
+// 	uniqueIndexFields, err := getUniqueIndexFieldsFromRegistry(entityName, token)
+// 	if err != nil {
+// 		// fallback: do nothing if uniqueIndexFields can't be fetched
+// 		return
+// 	}
+// 	for _, field := range uniqueIndexFields {
+// 		delete(body, field)
+// 	}
+// }
 
 // callRegistryUpdateAPI calls the registry update endpoint
 func callRegistryUpdateAPI(entityName, osid string, body map[string]interface{}, token string) (*http.Response, error) {
