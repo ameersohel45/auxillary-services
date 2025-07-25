@@ -174,6 +174,9 @@ func createSchemaRequest(row []string, head map[string]int) map[string]interface
 		}
 		// Sanitize the value
 		value := strings.TrimSpace(row[index])
+		if value == "" {
+			continue
+		}
 
 		// Split header by '.' for nesting
 		parts := strings.Split(header, ".")
